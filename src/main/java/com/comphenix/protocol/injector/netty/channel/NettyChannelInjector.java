@@ -1,6 +1,7 @@
 package com.comphenix.protocol.injector.netty.channel;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.SocketAddress;
 import java.util.Map;
@@ -12,8 +13,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import org.bukkit.Bukkit;
+import org.bukkit.Server;
 import org.bukkit.entity.Player;
 
 import com.comphenix.protocol.PacketType;
@@ -36,6 +39,7 @@ import com.comphenix.protocol.reflect.FuzzyReflection;
 import com.comphenix.protocol.reflect.StructureModifier;
 import com.comphenix.protocol.reflect.accessors.Accessors;
 import com.comphenix.protocol.reflect.accessors.FieldAccessor;
+import com.comphenix.protocol.reflect.accessors.MethodAccessor;
 import com.comphenix.protocol.reflect.fuzzy.FuzzyFieldContract;
 import com.comphenix.protocol.utility.MinecraftProtocolVersion;
 import com.comphenix.protocol.utility.MinecraftReflection;
@@ -89,6 +93,7 @@ public class NettyChannelInjector implements Injector {
     // references
     private final Object networkManager;
     private final Channel channel;
+    private final InboundPacketQueue inboundQueue;
 
     private final FieldAccessor channelField;
 
@@ -132,6 +137,7 @@ public class NettyChannelInjector implements Injector {
         // references
         this.networkManager = networkManager;
         this.channel = channel;
+        this.inboundQueue = new InboundPacketQueue(channel.eventLoop());
         this.listenerManager = listenerManager;
         this.injectionFactory = injector;
 
@@ -422,7 +428,7 @@ public class NettyChannelInjector implements Injector {
      */
     boolean hasInboundListener(PacketType type) {
         // always return true for types of the built-in listener (see #processInbound)
-        return type == PacketType.Handshake.Client.SET_PROTOCOL ||
+        return this.inboundQueue.hasPending() || type == PacketType.Handshake.Client.SET_PROTOCOL ||
                 type == PacketType.Login.Client.START ||
                 // check for plugin registed listener
                 this.listenerManager.hasInboundListener(type);
@@ -459,11 +465,24 @@ public class NettyChannelInjector implements Injector {
             }
         }
 
-        // invoke plugin listeners
+        boolean requiresMainThread = this.listenerManager.hasMainThreadListener(packet.getType()) && !Bukkit.isPrimaryThread();
+        if (!requiresMainThread && !this.inboundQueue.hasPending()) {
+            this.processInboundPacket(ctx, packet);
+            return;
+        }
+        this.inboundQueue.dispatch(requiresMainThread, task -> {
+            if (packet.getType().getProtocol() != Protocol.PLAY || !PandaInboundQueue.schedule(task)) {
+                ProtocolLibrary.getScheduler().runTask(task);
+            }
+        }, () -> this.processInboundPacket(ctx, packet));
+    }
+
+    private void processInboundPacket(ChannelHandlerContext ctx, PacketContainer packet) {
+        if (this.closed.get() || !ctx.channel().isActive()) return;
         if (this.listenerManager.hasInboundListener(packet.getType())) {
             this.processInboundInternal(ctx, packet);
         } else {
-            ctx.fireChannelRead(packet.getHandle());
+            this.ensureInEventLoop(ctx.channel().eventLoop(), () -> ctx.fireChannelRead(packet.getHandle()));
         }
     }
 
@@ -484,13 +503,6 @@ public class NettyChannelInjector implements Injector {
     }
 
     private void processInboundInternal(ChannelHandlerContext ctx, PacketContainer packetContainer) {
-        if (this.listenerManager.hasMainThreadListener(packetContainer.getType()) && !Bukkit.isPrimaryThread()) {
-            // not on the main thread but we are required to be reschedule the packet on the
-            // main thread
-            ProtocolLibrary.getScheduler().runTask(() -> this.processInboundInternal(ctx, packetContainer));
-            return;
-        }
-
         // create event and invoke listeners
         PacketEvent event = PacketEvent.fromClient(this, packetContainer, this.player);
         this.listenerManager.invokeInboundPacketListeners(event);
@@ -507,6 +519,32 @@ public class NettyChannelInjector implements Injector {
             NetworkMarker marker = NetworkMarker.getNetworkMarker(event);
             if (marker != null) {
                 this.networkProcessor.invokePostEvent(event, marker);
+            }
+        }
+    }
+
+    private static final class PandaInboundQueue {
+        private static final Consumer<Runnable> SUBMIT = findSubmitter();
+
+        static boolean schedule(Runnable task) {
+            if (SUBMIT == null) return false;
+            SUBMIT.accept(task);
+            return true;
+        }
+
+        private static Consumer<Runnable> findSubmitter() {
+            Server server = Bukkit.getServer();
+            if (!server.getName().equals("PandaSpigot")) return null;
+            try {
+                Method getServer = server.getClass().getMethod("getServer");
+                Method post = getServer.getReturnType().getMethod("postToMainThread", Runnable.class);
+                if (post.getReturnType() != void.class) return null;
+                Object minecraftServer = Accessors.getMethodAccessor(getServer).invoke(server);
+                MethodAccessor enqueue = Accessors.getMethodAccessor(post);
+                // Panda drains the same main-thread queue used by vanilla packets while waiting for the next tick.
+                return task -> enqueue.invoke(minecraftServer, task);
+            } catch (NoSuchMethodException ignored) {
+                return null;
             }
         }
     }
